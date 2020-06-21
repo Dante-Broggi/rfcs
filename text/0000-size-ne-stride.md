@@ -13,12 +13,53 @@ This RFC is proposing the addition of intrinsics and `core` traits and functions
 
 Why are we doing this? What use cases does it support? What is the expected outcome?
 
-The primary motivation for doing this is to support [Swift](https://swift.org) interoperability.
-The Swift 5 layout algorithm is one which distinguishes size and stride of types.
+The primary motivation for doing this is to support [Swift](https://swift.org) ABI interoperability.
+Such interoperability was discussed and considered briefly in [this internals thread](https://internals.rust-lang.org/t/a-stable-modular-abi-for-rust/12347)
+
+However, the Swift 5 layout algorithm is one which distinguishes size and stride of types.
 In particular it lays out latter fields of structs in the trailing padding of the preceding field,
 when such padding is sufficiently aligned.
 
-Due to this it would presently be UB/unsound to import such structs because none of Rust, rustc, nor any user crates promise that such latter fields will not be clobbered by accesses to earlier fields, and in fact user crates cannot even express the requirements they would need to uphold, which is what this RFC intends to correct.
+Due to this it would presently be UB/unsound to import such structs because none of Rust, rustc, core, std, nor any user crates promise that such latter fields will not be clobbered by accesses to earlier fields, and in fact user crates cannot even express the requirements they would need to uphold, which is what this RFC intends to correct.
+
+A possibly canonical example is this one ([playground](https://play.rust-lang.org/?version=stable&mode=debug&edition=2018&gist=deeeba557daf53d574e6e9484d34de73)):
+```Rust
+use core::num::NonZeroU8;
+use core::mem;
+
+// #[repr(Swift_5)]
+struct Inner(u16, u8);
+
+// #[repr(Swift_5)]
+struct Outer(Inner, NonZeroU8);
+
+
+const REPR_SWIFT_5: bool = false;
+
+fn foo(x: &mut Inner) {
+    x.1 = 0;
+}
+
+fn main() {
+    if REPR_SWIFT_5 {
+        assert_eq!(mem::size_of::<Inner>(), 4);
+        assert_eq!(mem::size_of::<Outer>(), 4);
+    } else {
+        assert_eq!(mem::size_of::<Inner>(), 4);
+        assert_eq!(mem::size_of::<Outer>(), 6);
+        
+    }
+
+    let nz = NonZeroU8::new(42).unwrap();
+    let i = Inner(335, 65);
+    let mut o = Outer(i, nz);
+    let ro = &mut o;
+    let ri = &mut ro.0;
+    foo(ri);
+    assert_eq!(ro.1, nz);
+    
+}
+```
 
 # Guide-level explanation
 [guide-level-explanation]: #guide-level-explanation
@@ -65,7 +106,7 @@ However, Rust reserves the right to add a `#[repr(...)]` for which the preceding
 
 For this reason, Rust provides the `Strided` trait, and the `std::mem::store_size_of` and `std::mem::stride_of` functions.
 
-The `Strided` trait is the trait which promises that the preceding code is both well formed and correct. Similar to `Sized`, `Strided` is an `auto trait` which is implicitly assumed for all generic parameters and can be explicitly rejected using `T: ?Strided`.
+The `Strided` trait is the trait which promises that the preceding code is both well formed and correct. Similar to `Sized`, `Strided` is an implicit `auto trait` which is implicitly assumed for all generic parameters and can be explicitly rejected using `T: ?Strided`.
 
 The two functions take on the two options available for `std::mem::size_of` when the guarantees of Strided may fail to hold:
 * `std::mem::store_size_of<T: ?Strided>` returns the number of bytes which may be stored when one has a `*mut T`.
@@ -143,6 +184,10 @@ pub const fn store_size_of<T>() -> usize {
     ret
 }
 
+/// Returns the stride of a type in bytes.
+///
+/// More specifically, this is the minimum distance
+/// in bytes between distinct well aligned `*const T`.
 #[unstable(feature = "prep_stride_ne_size", issue = "17027")]
 #[rustc_const_stable(feature = "prep_stride_ne_size", since = "1.46.0")]
 pub const fn stride_of<T>() -> usize {
@@ -159,10 +204,15 @@ pub const fn stride_of<T>() -> usize {
     ret
 }
 
-/// Returns the stride of a type in bytes.
+/// Returns the store size of a type in bytes.
 ///
-/// More specifically, this is the offset in bytes between successive elements
-/// in an array with that item type including alignment padding.
+/// More specifically, this is the maximum number
+/// of bytes which may be stored when one has a `*mut T`.
+/// When laid out in vectors and structures there may be
+/// additional padding between elements.
+///
+/// This is typicality the same as `store_size_of::<T>()`,
+/// but that requires `Sized`, and this does not.
 #[unstable(feature = "stride_ne_size", issue = "17027")]
 #[rustc_const_stable(feature = "prep_stride_ne_size", since = "1.46.0")]
 pub fn store_size_of_val<T: ?Sized>(val: *const T) -> usize {
@@ -186,6 +236,8 @@ This is a debatable decision, which is discussed [below](#rationale-and-alternat
 This RFC enables types to have sizes which are not multiples of their alignments.
 The only primitive which may benefit from this is `char`, which requires 21 bits, 
 which may be stored in 3 bytes.
+
+Note that while Swift does distinguish between `store_size` and `stride`, it's equivalent of `char`, `Unicode.Scalar` still has a `store_size` of 4.
 
 Should Rust change `char` to be `!Strided` and have a `store_size_of` 3 bytes?
 This is an [unresolved-question](#unresolved-questions).
@@ -214,7 +266,7 @@ This is added complexity to the standard library, which may not be considered wa
     `stride_of` could return `0` for ZSTs.
     This was not chosen, as the choice of having ZSTs return `align_of` for `stride_of`
     enables greater correctness, as while the naive allocation and pointer arithmetic
-    would still be inefficient, as it would request memory from the system allocator
+    would still be inefficient, as it would both request memory from the system allocator
     and not pack 2+aligned ZSTs, it would not fail as the current naive solution does,
     while still enabling such optimisations using `store_size_of`.
 
@@ -281,3 +333,9 @@ Note that having something written down in the future-possibilities section
 is not a reason to accept the current or a future RFC; such notes should be
 in the section on motivation or rationale in this or subsequent RFCs.
 The section merely provides additional information.
+
+###
+
+- support sub-byte layout algorithms?
+  - This would presumably enable generalizing over bit-packing 
+    and the concept of niches in rustc.
